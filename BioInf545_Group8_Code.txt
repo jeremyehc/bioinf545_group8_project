@@ -1,0 +1,588 @@
+# Code linked to final project of Group 8
+# BIOINF545, Winter 2025
+# Code developed by:
+# Rodolfo Ismael Cabrera Silva
+# Jeremy Chen
+# Niyati Harish Puranik
+# Paula Reichel
+# Meizhen Yao
+
+
+# Calling libraries
+
+library(tidyverse)
+library(Seurat)
+library(scIntegrationMetrics)
+library(SeuratWrappers)
+library(reticulate)
+library(patchwork)
+library(cowplot)
+library(dittoSeq)
+library(Azimuth)
+
+
+
+
+
+###################### Section 1: scIntegration Metrics ####################
+
+# Set working direcotry to save files
+
+setwd('/nfs/turbo/dcmb-class/bioinf545/groups/group_08/cellranger_results/Seurat/')
+
+
+# Loading Cohorts 1 - 3
+
+pathways <- c("/nfs/turbo/dcmb-class/bioinf545/groups/group_08/cellranger_results/Cohort_1/",
+                  '/nfs/turbo/dcmb-class/bioinf545/groups/group_08/cellranger_results/Cohort_2/1',
+                  '/nfs/turbo/dcmb-class/bioinf545/groups/group_08/cellranger_results/Cohort_2/2',
+                  '/nfs/turbo/dcmb-class/bioinf545/groups/group_08/cellranger_results/Cohort_3/')
+
+
+cohorts_names <- c("Cohort_1","Cohort_2_1","Cohort_2_2","Cohort_3")
+
+seu_list <- list()
+for (path in 1:length(pathways)){
+  
+ seu <- Read10X(pathways[path]) %>% 
+   CreateSeuratObject(,min.cells = 3, min.features = 200, project = cohorts_names[path])
+ 
+ seu[['percent.mt']] <- PercentageFeatureSet(seu, pattern = "^MT-")
+ 
+ seu_list[[path]] <- seu
+  
+}
+
+# Keeping it in Seurat V5 Format by making a single raw_seurat
+seuobj <- merge(seu_list[[1]], c(seu_list[[2]], seu_list[[3]],seu_list[[4]]), 
+                 add.cell.ids = cohorts_names, project = "Bioinf545")
+
+# Subsetting the dataset
+
+seuobj <- subset(seuobj, subset = nFeature_RNA < 5500 & nCount_RNA < 8000 & percent.mt < 5)
+
+
+# Adding celltype metadata (See Section 2)
+
+cell_type <- read.csv("/nfs/turbo/dcmb-class/bioinf545/groups/group_08/cellranger_results/Seurat/bioinf545_celltype_metadata.csv", row.names = 1)
+
+seuobj <- AddMetaData(object = seuobj, metadata = cell_type)
+
+# Neutrophil is a cluster with only 1 cell type and it is causing error in the integration metrics
+# this is because singletons are normally dropped. Removing that cell prior normalizing and scaling data
+
+Idents(seuobj) <- "predicted.celltype.l1"
+seuobj <- subset(seuobj, idents = "Neutrophil", invert =TRUE)
+
+# Running normal pipeline with log-transformation
+
+Idents(seuobj) <- 'orig.ident'
+
+seuobj <- seuobj %>% 
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>% 
+  RunPCA()
+
+
+### INTEGRATION SECTION 
+
+# Preparing variables for loop
+integration_methods_names <- c("integrated.cca", "integrated.rpca", "integrated.harmony", "integrated.mnn")
+
+
+names(integration_methods_names) <- c("CCA", "RPCA", "Harmony", "FastMNN")
+
+# Create a list of functions
+
+integration_methods <- list(
+  "CCA" = "CCAIntegration",
+  "RPCA" = "RPCAIntegration",
+  "Harmony" = "HarmonyIntegration",
+  "FastMNN" = "FastMNNIntegration"
+  )
+
+# Looping through integration methods
+
+for (i in 1:4){
+  print(paste("Running loop", i))
+  new.reduction = integration_methods_names[i]
+  method_name = names(integration_methods_names)[i]
+  
+  seuobj <-  IntegrateLayers(
+    object = seuobj, method = integration_methods[[method_name]],
+    orig.reduction = "pca", new.reduction = new.reduction,
+    verbose = TRUE )
+  
+}
+
+# scvi hits an error when inside the loop. Running it individually
+
+seuobj <- IntegrateLayers(
+  object = seuobj, method = SeuratWrappers::scVIIntegration,
+  orig.reduction = "pca", new.reduction = "integrated.scvi",
+  conda_env = "/home/ricsilva/.conda/envs/scvi-env"
+)
+
+# Lympathic endothelia is only in own of the cohorts, so CiLISI cannot be made for it
+# Performing CiLISI for all other celltypes
+
+celltypes <- unique(seuobj$predicted.celltype.l1)
+
+
+celltypes <- celltypes[1:12]
+
+
+# Performing scIntegrationMetrics
+
+raw_metrics <- getIntegrationMetrics(seuobj, meta.label = "predicted.celltype.l1",
+                                     meta.batch = "orig.ident",
+                                     iLISI_perplexity = 20,
+                                     method.reduction = "pca",
+                                     metricsLabels = celltypes)
+
+cca_metrics <- getIntegrationMetrics(seuobj, meta.label = "predicted.celltype.l1",
+                                       meta.batch = "orig.ident",
+                                       iLISI_perplexity = 20, method.reduction = integration_methods_names[1],
+                                     metricsLabels = celltypes)
+
+rpca_metrics <- getIntegrationMetrics(seuobj, meta.label = "predicted.celltype.l1",
+                                       meta.batch = "orig.ident",
+                                       iLISI_perplexity = 20, method.reduction = integration_methods_names[2],
+                                      metricsLabels = celltypes)
+
+harmony_metrics <- getIntegrationMetrics(seuobj, meta.label = "predicted.celltype.l1",
+                                       meta.batch = "orig.ident",
+                                       iLISI_perplexity = 20, method.reduction = integration_methods_names[3],
+                                       metricsLabels = celltypes)
+
+
+fastmnn_metrics <- getIntegrationMetrics(seuobj, meta.label = "predicted.celltype.l1",
+                                         meta.batch = "orig.ident",
+                                         iLISI_perplexity = 20, 
+                                         method.reduction = integration_methods_names[4],
+                                         metricsLabels = celltypes)
+
+
+scvi_metrics <- getIntegrationMetrics(seuobj, meta.label = "predicted.celltype.l1",
+                                     meta.batch = "orig.ident",
+                                     iLISI_perplexity = 20,
+                                     method.reduction = "integrated.scvi",
+                                     metricsLabels = celltypes)
+
+# Visualizing results
+
+unlist(raw_metrics)
+
+unlist(cca_metrics)
+
+unlist(rpca_metrics)
+
+unlist(harmony_metrics)
+
+unlist(fastmnn_metrics)
+
+unlist(scvi_metrics)
+
+
+# Combining all the results in a list to only save 1 object
+metrics <- list()
+working_metric <- c()
+for (i in 1:8){
+  working_metric <- c(working_metric, 
+                      unlist(raw_metrics)[i],
+                      unlist(cca_metrics)[i],
+                      unlist(rpca_metrics)[i],
+                      unlist(harmony_metrics)[i],
+                      unlist(fastmnn_metrics)[i],
+                      unlist(scvi_metrics)[i])
+  
+  names(working_metric) <- c("RAW","CCA","RPCA","HARMONY","FASTMNN","SCVI")
+  
+  metrics[[i]] <- working_metric
+  
+  working_metric <- c()
+}
+
+
+names(metrics) <- c("iLISI","norm_iLISI",
+                    "CiLISI","CiLISI_means",
+                    "norm_cLISI", "norm_cLISI_means",
+                    "celltype_ASW", "celltype_ASW_means")
+
+
+
+
+# confirming that each list element has the values of each integration method per metric
+
+for (i in 1:length(metrics)){
+ 
+  print(metrics[i])
+}
+
+# Saving results
+
+write_rds(x=seuobj, file = "Seruat_file.rds")
+write_rds(x=metrics, file = "Integration_metrics.rds")
+
+
+###################### Section 2: Cell Annotation with Azimuth ##############
+
+ 
+# Using Azimuth to label the cells as they should due to the GSE not providing cell names
+# For Azimuth to work, you need to only have 1 layer of counts and data
+ 
+# install.packages('leidenbase')
+# remotes::install_github('satijalab/azimuth', ref = 'master')
+ 
+# Set working direcotry to save files
+ 
+setwd('/nfs/turbo/dcmb-class/bioinf545/groups/group_08/cellranger_results/Seurat/')
+ 
+ 
+# Loading Cohorts 1 - 3
+ 
+pathways <- c("/nfs/turbo/dcmb-class/bioinf545/groups/group_08/cellranger_results/Cohort_1/",
+              '/nfs/turbo/dcmb-class/bioinf545/groups/group_08/cellranger_results/Cohort_2/1',
+              '/nfs/turbo/dcmb-class/bioinf545/groups/group_08/cellranger_results/Cohort_2/2',
+              '/nfs/turbo/dcmb-class/bioinf545/groups/group_08/cellranger_results/Cohort_3/')
+
+cohorts_names <- c("Cohort_1","Cohort_2_1","Cohort_2_2","Cohort_3")
+ 
+seu_list <- list()
+for (path in 1:length(pathways)){
+   
+  seu <- Read10X(pathways[path]) %>% 
+    CreateSeuratObject(,min.cells = 3, min.features = 200, project = cohorts_names[path])
+  
+  seu[['percent.mt']] <- PercentageFeatureSet(seu, pattern = "^MT-")
+  
+  seu_list[[path]] <- seu
+  
+}
+ 
+# Keeping it in Seurat V5 Format by making a single raw_seurat
+seuobj <- merge(seu_list[[1]], c(seu_list[[2]], seu_list[[3]],seu_list[[4]]), 
+                 add.cell.ids = cohorts_names, project = "Bioinf545")
+ 
+# Subsetting the dataset
+ 
+seuobj <- subset(seuobj, subset = nFeature_RNA < 5500 & nCount_RNA < 8000 & percent.mt < 5)
+ 
+seuobj <- JoinLayers(seuobj)
+ 
+ 
+# Running normal pipeline with log-transformation
+ 
+seuobj <- seuobj %>% 
+  NormalizeData() %>%
+  FindVariableFeatures() %>%
+  ScaleData() 
+ 
+# Running Azimuth
+ 
+azimuth_res <- RunAzimuth(query = seuobj,
+                          reference = '/nfs/turbo/dcmb-class/bioinf545/groups/group_08/cellranger_results/Seurat/Azimuth_Adipose_Ref',
+                          assay = "RNA",
+                          umap.name = "ref.umap")
+ 
+ 
+# Extracting the metadata added by Azimuth
+
+nombres <- colnames(azimuth_res@meta.data)[5:9]
+
+df <- FetchData(azimuth_res, nombres)
+
+# Saving Azimuth results
+write.csv(df, file = "bioinf545_celltype_metadata.csv")
+
+
+###################### Section 4: Figure 2 ##################################
+
+
+
+seuobj <- read_rds("Seruat_file.rds")
+# Generating dotplot of gene expression per celltype
+
+
+# Using 3 genes per cell type from the list of genes in the Azimuth reference 
+
+celltypes <- list(
+`Endothelial Genes` = c("MECOM","ANO2","VWF"),
+`Macrophage Genes` = c("F13A1","MRC1","LGMN"),
+`ASPC Genes` = c("NEGR1","LAMA2","CXCL14"),
+`Adipocyte Genes` = c("GPAM","ADIPOQ","ACACB"),
+`Smooth Muscle Genes` = c("MYH11","TAGLN","ADGRL3"),
+`Pericyte Genes` = c("COL25A1","POSTN","DLC1"),
+`T Cells Genes` = c("IL7R","THEMIS","CAMK4"),
+`Dendritic Genes` = c("HLA-DRB1","FLT3","HLA-DPB1"),
+`Mast Cells Genes` = c("CPA3","KIT","TPSB2"),
+`NK Cells Genes` = c("GNLY","CD247","SMAD3"),
+`Monocyte Genes` = c("VCAN","FCN1","SLC11A1"),
+`B Cells Genes` = c("IGKC","MS4A1", "BANK1"),
+`Lympathic Endothelial Genes` = c("MMRN1","CCL21","AL357507.1")
+)
+
+genes <- unlist(celltypes)
+
+names(genes) <- NULL
+
+# Generating the DotPlot
+
+# Ensuring that the celltype order is the same as the list object to have a diagonal expression
+
+seuobj$predicted.celltype.l1 <- factor(seuobj$predicted.celltype.l1, 
+                                         levels = names(celltypes))
+
+p<- dittoDotPlot(seuobj, vars=genes, group.by = "predicted.celltype.l1", 
+                 min.color = "lightslateblue", max.color = "tomato3", 
+                 mid.color = "lavender")
+
+
+ggsave("Figure_2.png", plot=p, device ="png",
+       width = 12, height = 6, units = "in", 
+       dpi =300, bg = "white")
+
+
+
+###################### Section 5: Figure 3 ##################################
+
+
+seuobj <- read_rds("Seruat_file.rds")
+# Generating the UMAP for each integration method
+
+integration_methods_names <- c("pca","integrated.cca", "integrated.rpca", "integrated.harmony", "integrated.mnn", "integrated.scvi")
+reduction_names <- c("umap.unintegrated",,"umap.cca", "umap.rpca", "umap.harmony", "umap.mnn", "umap.scvi")
+plot_titles <- c("Unintegrated","CCA", "RPCA","Harmony","Fast MNN","SCVI")
+
+plot_list <-list()
+for (reduction in seq_along(integration_methods_names)){
+
+	seuobj <- RunUMAP(seuobj,  
+	     dims = 1:30,
+	     reduction.name = reduction_names[reduction], 
+	     reduction = integration_methods_names[reduction])
+	
+	p <- DimPlot(seuobj, reduction = reduction_names[reduction], group.by = 'orig.ident', label = T) + 
+	     ggtitle(plot_titles[reduction])
+		 
+	plot_list[[reduction]] <- p
+}
+
+
+# Combining UMAPs in a single plote
+p <- cowplot::plot_grid(plotlist = plot_list, ncol = 3, labels = LETTERS[1:6])
+
+# Saving Figure
+
+ggsave(filename = "Figure_1.png", plot = p, 
+       device = "png", dpi = 300, bg = "white",
+       width = 18, height = 13, units = "in")
+
+
+
+###################### Section 3: Figure 2 ##################################
+
+# Metrics from all the integration methods where combine in a dataframe in excel
+
+results <- read_csv("Metrics.csv")
+
+# Convert from wide to long format
+long_data <- results %>%
+  pivot_longer(-Metrics, names_to = "Method", values_to = "Score")
+
+# Extract unintegrated scores into a lookup table
+unintegrated_scores <- long_data %>%
+  filter(Method == "Unintegrated") %>%
+  select(Metrics, Unintegrated_Score = Score)
+
+# Join back to compute gain
+percent_gain <- long_data %>%
+  filter(Method != "Unintegrated") %>%
+  left_join(unintegrated_scores, by = "Metrics") %>%
+  mutate(Percent_Gain = (Score - Unintegrated_Score) / abs(Unintegrated_Score) * 100)
+
+#set desired order of Metrics
+order_metrics <- c("iLISI", "Norm iLISI", "CiLISI", "CiLISI Means", 
+                   "Norm cLISI", "Norm cLISI means", "Celltype ASW", 
+                   "Celltype ASW means")
+percent_gain$Metrics <- factor(percent_gain$Metrics, levels = order_metrics)
+percent_gain$Metrics <- factor(percent_gain$Metrics,
+                               levels = c("iLISI", "Norm iLISI", "CiLISI", "CiLISI Means", "Norm cLISI", "Norm cLISI means", "Celltype ASW", "Celltype ASW means"))
+# Set desired order for Integration Methods
+method_order <- c("CCA", "RPCA", "Harmony", "FastMNN", "scVI")
+percent_gain$Method <- factor(percent_gain$Method, levels = method_order)
+
+# Generating the plot
+p <- ggplot(percent_gain, aes(x = Method, y = Percent_Gain, fill = Method)) +
+       geom_bar(stat = "identity", position = "dodge") +
+       facet_wrap(~ Metrics, scales = "free_y") +
+       theme_minimal() +
+       labs(title = "Impact of Integration Methods on Metric Scores",
+            y = "Metric Score Difference to unintegrated data (%)",
+            x = "Integration Method") +
+       theme(axis.text.x = element_text(angle = 45, hjust = 1),
+             panel.border = element_rect(colour = "black", fill = NA, size = 1))
+
+ggsave("Figure_3.png", plot=p, device ="png",
+       width = 12, height = 6, units = "in", 
+       dpi =300, bg = "white")
+
+###################### Section 6: Supplementary Figure #######################
+
+seuobj <- read_rds("Seruat_file.rds")
+
+# Making vector of reduction methods
+
+integration_methods_names <- c("umap.unintegrated",
+                               "umap.cca", 
+                               "umap.rpca", 
+                               "umap.harmony",
+                               "umap.mnn",
+                               "umap.scvi")
+
+names(integration_methods_names)  <-c("Unintegrated", "CCA", "RPCA", "Harmony", "FastMNN", "scVI")
+
+# Making list of celltype and their respective genes
+
+celltypes <- list(
+`Endothelial Genes` = c("MECOM","ANO2","VWF"),
+`Macrophage Genes` = c("F13A1","MRC1","LGMN"),
+`ASPC Genes` = c("NEGR1","LAMA2","CXCL14"),
+`Adipocyte Genes` = c("GPAM","ADIPOQ","ACACB"),
+`Smooth Muscle Genes` = c("MYH11","TAGLN","ADGRL3"),
+`Pericyte Genes` = c("COL25A1","POSTN","DLC1"),
+`T Cells Genes` = c("IL7R","THEMIS","CAMK4"),
+`Dendritic Genes` = c("HLA-DRB1","FLT3","HLA-DPB1"),
+`Mast Cells Genes` = c("CPA3","KIT","TPSB2"),
+`NK Cells Genes` = c("GNLY","CD247","SMAD3"),
+`Monocyte Genes` = c("VCAN","FCN1","SLC11A1"),
+`B Cells Genes` = c("IGKC","MS4A1", "BANK1"),
+`Lympathic Endothelial Genes` = c("MMRN1","CCL21","AL357507.1")
+)
+
+
+# Generating the Suplementary Figure 
+
+
+# Creating a list that will contain all the sub_panel
+
+final_panel <- list()
+
+# Starting the loop to process all the images
+
+for (markers in seq_along(celltypes)){
+
+  # Extracting the genes from the list with gene information
+  
+  genes <- celltypes[[markers]]
+  
+  # Making a list that will whole the sub_panel
+  
+  sub_panel <- list()
+  
+  # We are going to create 1 column of gene plots at a time
+  
+  for (gene in seq_along(genes)) {
+    
+    # Making a list that will whole 1 column of images at a time
+	
+    combining_plots <- list()
+    
+    # Taking a single gene information
+	
+    gene <- genes[gene]
+    
+    # Starting the loop to create each individual plot for each reduction
+    
+    for (integration_method in seq_along(integration_methods_names)) {
+	
+      # Getting the reduction information to use in FeaturePlots()
+      
+      reduction <- integration_methods_names[integration_method]
+      
+      # Getting the name associated with the integration method
+      # to incorporate as the y axis label
+      
+      reduction_name <- names(integration_methods_names)[integration_method]
+      
+      # Creating the Feature Plot
+      
+      p <- FeaturePlot(seuobj, features = gene, reduction = reduction)
+      
+ 
+      # Removing the title to all but the first plot created per gene
+      # Removing Legends and axis from all plots
+	  
+      if (integration_method != 1) {
+        p <- p + NoLegend() + NoAxes() + theme(plot.title = element_blank())
+      } else {
+        p <- p + NoLegend() + NoAxes()
+      }
+      
+      # Add vertical y-label with integration method name only on the first column (a.k.a first gene)
+	  
+      if (gene ==1){
+        p <- p +
+          theme(
+            axis.title.y = element_text(angle = 90, # Placing it vertical
+                                        size = 15,  # increasing size
+                                        face="bold", # Making it Bold (Similar to gene title)
+                                        vjust = 0.5), # Adjust for the y-axis label to be in the center of the y-axis
+            axis.text = element_blank(), # Making sure all axis text is gone 
+            axis.ticks = element_blank() # Making sure all axis ticks are gone
+          ) +
+          labs(y = reduction_name) # Adding the Y-axis name
+      }
+     
+      # Saving edited plot
+	  
+      combining_plots[[integration_method]] <- p[[1]] 
+    }
+    
+    # Stacking vertically all the plots for the gene and placing legend on the right
+	
+    gene_plot <- wrap_plots(combining_plots, 
+                            ncol = 1) + 
+      plot_layout(guides = "collect") & # Recovering Legend information
+      theme(legend.position = "right") # Placing legend to the right
+
+    
+    # Saving whole sub_panel
+    
+    sub_panel[[gene]] <- gene_plot
+	
+	# Starting the new set of plots with the following gene
+	
+  }
+  
+  # Plots in a single list but still disconnected
+  # Combining plots to complete the panel
+  # Adding the information of which celltype the genes belong to as an overall title
+  
+  final_plot <- wrap_plots(sub_panel, ncol = 3) +
+    plot_annotation(title = names(celltypes)[[markers]],
+                    theme = theme(plot.title = element_text(size = 18, # Increasing size
+                                                            face = "bold", # Making bold
+                                                            hjust = 0.5))) # Putting in the center
+  
+  final_panel[[markers]] <- final_plot
+  
+  # Starting the new set of genes related to the following cell type
+}
+
+
+# Combining all the images in a single figure to save as a Supplementary Figure
+
+full_image <- wrap_plots(final_panel, ncol = 3) +
+  plot_annotation(title = "Supplementary Figure", # Labeling the whole Figure
+                  theme = theme(plot.title = element_text(size = 18, # Increasing size
+                                                          face = "bold", # Making bold
+                                                          hjust = 0.5))) # Putting in the center
+
+# Saving the Supplementary Figure
+
+ggsave(filename = "Supplementary_Figure.png",
+       plot=full_image, device = "png",
+       width = 30, height = 40, units = "in",
+       dpi = 300)
